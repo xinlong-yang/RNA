@@ -17,11 +17,15 @@ from torch.nn import Parameter
 from torch.autograd import Variable
 from memoryBank import MemoeyBank
 from DomainDiscriminator import DomainDiscriminator
-
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
+def linear_mmd(f_of_X, f_of_Y):
+    loss = 0.0
+    delta = f_of_X - f_of_Y
+    loss = torch.mean(torch.mm(delta, torch.transpose(delta, 0, 1)))
+    return loss
+
 def Entropy(input_):
-    bs = input_.size(0)
     epsilon = 1e-5
     entropy = -input_ * torch.log(input_ + epsilon)
     entropy = torch.sum(entropy, dim=1)
@@ -84,15 +88,23 @@ def train(
     optimizer_warmup = optim.SGD(model.get_Other_parameters(), lr=1e-5, momentum=0.9, weight_decay=1e-5)
     optimizer = optim.SGD(model.get_Other_parameters() + domain_discri.get_parameters(), lr=1e-4, momentum=0.9, weight_decay=1e-5)
 
+
     start = time()
     criterion_CE = loss.OrthoHashLoss() 
     criterion_CLS = loss.OrthoHashLoss() 
     criterion_ADV = loss.DomainAdversarialLoss(domain_discri) 
 
-
     Ms = MemoeyBank(1000, 4096, device)  
     Mt = MemoeyBank(1000, 4096, device)  
 
+    # loss weight
+    A_st_n = 0.5
+    J_w_n = 0.5
+    max_Jw = 1
+    min_Jw = 1
+    Ast_max = 0
+    Ast_min = 0
+    
     for epoch in range(max_iter):
         
         if epoch <= warmup_epoch:
@@ -145,6 +157,19 @@ def train(
                     mAP,
                 ))
         else:
+            A_st_norm = A_st_n
+            J_w_norm = J_w_n
+            A_st_max= Ast_max
+            A_st_min= Ast_min
+            max_J_w = max_Jw
+            min_J_w = min_Jw
+
+            fea_for_LDA= np.empty(shape=(0,4096)) 
+            fea_s_for_LDA = np.empty(shape=(0,4096)) 
+            label_for_LDA = np.empty(shape=(0,1)) 
+            label_s_for_LDA = []
+
+            # begin iteration
             for ((data_s, data_s_aug, target_s, _), (data_t, data_t_aug, target_t_gt, _)) in zip(train_s_dataloader, train_t_dataloader):
                 bs = data_s.shape[0]
                 optimizer.zero_grad()
@@ -176,28 +201,138 @@ def train(
                 for idx in range(f_s.shape[0]):
                     if p_s[idx,target_s_no_onehot[idx]] > t:
                         mask_s_clean[idx] = True
-                Ms.enqueue_dequeue(f_s[mask_s_clean,:].detach(), target_s_no_onehot[mask_s_clean])
+
+                if torch.sum(mask_s_clean) != 0: # make sure there are clean samples
+                    Ms.enqueue_dequeue(f_s[mask_s_clean,:].detach(), target_s_no_onehot[mask_s_clean])
 
                 p_t = f_t @ class_center.T
                 p_t = torch.softmax(p_t,dim=1) # (bs, num_class)
                 mask_t_clean = torch.tensor([False] * f_t.shape[0])
-                target_t_no_onehot = torch.zeros(f_t.shape[0])
+                target_t_no_onehot = torch.zeros(f_t.shape[0],dtype=torch.long) # label must be Long type
                 label_t = torch.argmax(p_t,dim = 1) 
                 for idx in range(f_t.shape[0]):
                     target_t_no_onehot[idx] = label_t[idx]
                     if p_t[idx,label_t[idx]] > t:
                         mask_t_clean[idx] = True
 
-                Mt.enqueue_dequeue(f_t[mask_t_clean,:].detach(), target_t_no_onehot[mask_t_clean])
+                if torch.sum(mask_t_clean) != 0:
+                    Mt.enqueue_dequeue(f_t[mask_t_clean,:].detach(), target_t_no_onehot[mask_t_clean])
+                    # weight
+                    weight_s = 1 + p_s[mask_s_clean,target_s_no_onehot[mask_s_clean]].detach()
+                    weight_t = 1 + p_t[mask_t_clean,target_t_no_onehot[mask_t_clean]].detach()
+                    loss_cls,_ = criterion_CLS(logit_s[mask_s_clean], code_s[mask_s_clean], target_s_no_onehot[mask_s_clean], False)
+                    loss_adv = criterion_ADV(f_s[mask_s_clean], f_t[mask_t_clean], weight_s, weight_t)
 
-                loss_cls,_ = criterion_CLS(logit_s[mask_s_clean], code_s[mask_s_clean], target_s_no_onehot[mask_s_clean], False)
-                loss_adv = criterion_ADV(f_s[mask_s_clean], f_t[mask_t_clean])
-                loss_all = loss_cls + loss_adv
+                    # loss balance
+                    T_complex = A_st_norm / (A_st_norm + (1.0 - J_w_norm))
+                    T = T_complex.real
+                    loss_all = T * loss_cls + (1 - T) * loss_adv
+                    
+                else:
+                    continue # there are no clean samples in source domain in this batch, continue to next batch
+
+                if loss_adv == None or loss_cls == None:
+                    print('None: ', loss_adv, loss_cls, torch.sum(mask_s_clean), torch.sum(mask_t_clean))
+                else:
+                    print('Normal: ', loss_adv, loss_cls, torch.sum(mask_s_clean), torch.sum(mask_t_clean))
 
                 loss_all.backward()
                 optimizer.step()
-                
+
+                # compute balance value
+                label_s_test = target_s_no_onehot
+                feat_s_test = f_s
+                label_s_test_np = label_s_test.cpu().detach().numpy() 
+                feat_s_test_np = feat_s_test.cpu().detach().numpy()
+                label_s_for_LDA = np.concatenate((label_s_for_LDA,label_s_test_np),axis=0)
+                fea_s_for_LDA = np.vstack((fea_s_for_LDA,feat_s_test_np))
+
+                feat_test = f_t
+                feat_test_np = feat_test.cpu().detach().numpy()
+                fea_for_LDA = np.vstack((fea_for_LDA,feat_test_np))
+                label_test_np = label_t.cpu().detach().numpy()
+                label_test_np = label_test_np.reshape(f_t.shape[0],1)
+                label_for_LDA = np.vstack((label_for_LDA,label_test_np))
+
+            f_of_X = torch.from_numpy(fea_s_for_LDA)
+            f_of_Y = torch.from_numpy(fea_for_LDA)
+            loss_mmd = linear_mmd(f_of_X ,f_of_Y)
+            A_st = loss_mmd.cpu().detach().numpy()
+            A_st_max = max(abs(A_st_max),abs(A_st))
+            A_st_min = min(abs(A_st_min),abs(A_st))
+            A_st_norm = abs(A_st-A_st_min)/(A_st_max-A_st_min+1e-6)
+
+                  
+            n_dim = num_class-1
+            clusters1 = np.unique(label_s_for_LDA)
+
+            Sw1 = np.zeros((fea_s_for_LDA.shape[1],fea_s_for_LDA.shape[1]))
+            for i in clusters1:
+                datai1 = fea_s_for_LDA[label_s_for_LDA.reshape(-1) == i]
+                datai1 = datai1-datai1.mean(0)
+                Swi1 = np.mat(datai1).T*np.mat(datai1)
+                Sw1 += Swi1
+
+
+            SB1 = np.zeros((fea_s_for_LDA.shape[1],fea_s_for_LDA.shape[1]))
+            u1 = fea_s_for_LDA.mean(0) 
+
+            for i in clusters1:
+                Ni1 = fea_s_for_LDA[label_s_for_LDA.reshape(-1) == i].shape[0]
+                ui1 = fea_s_for_LDA[label_s_for_LDA.reshape(-1) == i].mean(0)  
+                SBi1 = Ni1*np.mat(ui1 - u1).T*np.mat(ui1 - u1)
+                SB1 += SBi1
+            S1= np.linalg.inv(Sw1+(1e-6*np.eye(Sw1.shape[0])))*SB1
+            eigVals1,eigVects1 = np.linalg.eig(S1)  
+            eigValInd1 = np.argsort(eigVals1)
+            eigValInd1 = eigValInd1[:(-n_dim-1):-1]
+            J_max1 = 0
+            for i in range(n_dim):
+                J_max1 = J_max1 + eigVals1[eigValInd1[i]]
+            J_w_s = J_max1 / num_class
+            max_J_w = max(max_J_w,J_w_s)
+            min_J_w = min(min_J_w,J_w_s)
+                   
+            n_dim = num_class - 1
+            clusters = np.unique(label_for_LDA)
+
+          
+            Sw = np.zeros((fea_for_LDA.shape[1],fea_for_LDA.shape[1]))
+            for i in clusters:
+                datai = fea_for_LDA[label_for_LDA.reshape(-1) == i]
+                datai = datai-datai.mean(0)
+                Swi = np.mat(datai).T*np.mat(datai)
+                Sw += Swi
+
+            # between_class scatter matrix
+            SB = np.zeros((fea_for_LDA.shape[1],fea_for_LDA.shape[1]))
+            u = fea_for_LDA.mean(0)  
+
+            for i in clusters:
+                Ni = fea_for_LDA[label_for_LDA.reshape(-1) == i].shape[0]
+                ui = fea_for_LDA[label_for_LDA.reshape(-1) == i].mean(0)  
+                SBi = Ni * np.mat(ui - u).T * np.mat(ui - u)
+                SB += SBi
+
+            S = np.linalg.inv(Sw + (1e-6 * np.eye(Sw.shape[0]))) * SB
+            eigVals,eigVects = np.linalg.eig(S)  
+            eigValInd = np.argsort(eigVals)
+            eigValInd = eigValInd[:(-n_dim-1):-1]
+            J_max = 0
+            for i in range(n_dim):
+                J_max = J_max + eigVals[eigValInd[i]]
+            J_w_t = J_max / num_class
+            min_J_w = min(min_J_w,J_w_t)
+            max_J_w = max(max_J_w,J_w_t)
+            
+            J_w = min(J_w_s,J_w_t)
+            J_w_norm = (J_w - min_J_w) / (max_J_w - min_J_w + 1e-6)
+            Ast_min ,Ast_max, min_Jw, max_Jw, A_st_n, J_w_n = A_st_min, A_st_max, min_J_w, max_J_w, A_st_norm, J_w_norm # update
+
             logger.info('[Epoch:{}/{}][loss_all:{:.4f}]'.format(epoch+1, max_iter, loss_all.item()))
+
+
+
             # Evaluate
             if (epoch % evaluate_interval == evaluate_interval-1):
                 mAP = evaluate(model,
@@ -289,7 +424,6 @@ def generate_code(model, dataloader, code_length, device):
             data = data.to(device)
             _,_,outputs= model(data)
             code[index, :] = outputs.sign().cpu() 
-
     return code
 
 
