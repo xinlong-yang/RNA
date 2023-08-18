@@ -19,6 +19,7 @@ from memoryBank import MemoeyBank
 from DomainDiscriminator import DomainDiscriminator
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
+'''mmd'''
 def linear_mmd(f_of_X, f_of_Y):
     loss = 0.0
     delta = f_of_X - f_of_Y
